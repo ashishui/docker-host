@@ -1,13 +1,115 @@
-FROM jenkinsci/jenkins:lts
- 
-USER root
-RUN apt-get update -qq \
-    && apt-get install -qqy apt-transport-https ca-certificates curl gnupg2 software-properties-common 
-RUN curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
-RUN add-apt-repository \
-   "deb [arch=amd64] https://download.docker.com/linux/debian \
-   $(lsb_release -cs) \
-   stable"
-RUN apt-get update  -qq \
-    && apt-get install docker-ce=17.12.1~ce-0~debian -y
-RUN usermod -aG docker jenkins
+FROM openshift3/ose-cli:v3.11.272.20200818.074850
+ENV __doozer=update BUILD_RELEASE=1 BUILD_VERSION=v3.11.272 OS_GIT_MAJOR=3 OS_GIT_MINOR=11 OS_GIT_PATCH=272 OS_GIT_TREE_STATE=clean OS_GIT_VERSION=3.11.272-1 SOURCE_GIT_TREE_STATE=clean 
+ENV __doozer=merge OS_GIT_COMMIT=b7442aa OS_GIT_VERSION=3.11.272-1-b7442aa SOURCE_DATE_EPOCH=1597245651 SOURCE_GIT_COMMIT=b7442aa2f11e04f870f878a646b0f8384a296316 SOURCE_GIT_TAG=b7442aa SOURCE_GIT_URL=https://github.com/openshift/jenkins 
+
+# Jenkins image for OpenShift
+#
+# This image provides a Jenkins server, primarily intended for integration with
+# OpenShift v3.
+#
+# Volumes: 
+# * /var/jenkins_home
+# Environment:
+# * $JENKINS_PASSWORD - Password for the Jenkins 'admin' user.
+
+MAINTAINER OpenShift Developer Services <jenkins+openshift-dev-services@redhat.com>
+
+ENV JENKINS_VERSION=2 \
+    HOME=/var/lib/jenkins \
+    JENKINS_HOME=/var/lib/jenkins \
+    JENKINS_UC=https://updates.jenkins.io \
+    OPENSHIFT_JENKINS_IMAGE_VERSION=3.11 \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8
+
+
+# Labels consumed by Red Hat build service
+
+# 8080 for main web interface, 50000 for slave agents
+EXPOSE 8080 50000
+
+RUN : 'removed yum-config-manager' \
+ &&     : 'removed yum-config-manager' \
+ &&      : 'removed yum-config-manager' \
+ &&      : 'removed yum-config-manager' \
+ || : \
+ &&     ln -s /usr/lib/jenkins /usr/lib64/jenkins \
+ &&     yum -y update \
+ &&     x86_EXTRA_RPMS=$(if [ "$(uname -m)" == "x86_64" ]; then echo -n java-11-openjdk.i686 java-11-openjdk-devel.i686 ; fi) \
+ &&     INSTALL_PKGS="dejavu-sans-fonts wget rsync gettext git tar zip unzip openssl bzip2 java-11-openjdk java-11-openjdk-devel atomic-openshift-clients jenkins-2.* jenkins-2-plugins nss_wrapper dumb-init" \
+ &&     yum --setopt=protected_multilib=false -y install $INSTALL_PKGS $x86_EXTRA_RPMS \
+ &&     rpm -V  $INSTALL_PKGS $x86_EXTRA_RPMS \
+ &&     yum clean all  \
+ &&     localedef -f UTF-8 -i en_US en_US.UTF-8
+
+COPY ./contrib/openshift /opt/openshift
+COPY ./contrib/jenkins /usr/local/bin
+ADD ./contrib/s2i /usr/libexec/s2i
+ADD release.version /tmp/release.version
+
+# Remove the base-plugins.txt file because it's only used for Centos
+# and its presence in the rhel image is confusing.
+RUN rm /opt/openshift/base-plugins.txt && \ 
+    mkdir -p /opt/openshift/plugins && \
+    # we symlink the rpm installed plugins from /usr/lib/jenkins to /opt/openshift/plugins so that
+    # future upgrades of the image and their RPM install automatically get picked by jenkins;
+    # we use symlinks vs. actual files to delineate whether the user has overridden a plugin (and
+    # by extension taken over its future maintenance)
+    for FILENAME in /usr/lib/jenkins/*hpi ; do ln -s $FILENAME /opt/openshift/plugins/`basename $FILENAME .hpi`.jpi; done &&\
+    chmod -R 775 /etc/alternatives && \
+    chmod -R 775 /var/lib/alternatives && \
+    chmod -R 775 /usr/lib/jvm && \
+    chmod 775 /usr/bin && \
+    chmod 775 /usr/lib/jvm-exports && \
+    chmod 775 /usr/share/man/man1 && \
+    chmod 775 /var/lib/origin && \
+    unlink /usr/bin/java && \
+    unlink /usr/bin/jjs && \
+    unlink /usr/bin/keytool && \
+    unlink /usr/bin/pack200 && \
+    unlink /usr/bin/rmid && \
+    unlink /usr/bin/rmiregistry && \
+    unlink /usr/bin/unpack200 && \
+    unlink /usr/share/man/man1/java.1.gz && \
+    unlink /usr/share/man/man1/jjs.1.gz && \
+    unlink /usr/share/man/man1/keytool.1.gz && \
+    unlink /usr/share/man/man1/pack200.1.gz && \
+    unlink /usr/share/man/man1/rmid.1.gz && \
+    unlink /usr/share/man/man1/rmiregistry.1.gz && \
+    unlink /usr/share/man/man1/unpack200.1.gz && \
+    # need to create <plugin>.pinned files when upgrading "core" plugins like credentials or subversion that are bundled with the jenkins server
+    # Currently jenkins v2 does not embed any plugins, but for reference:
+    # touch /opt/openshift/plugins/credentials.jpi.pinned && \
+    rmdir /var/log/jenkins && \
+    /usr/local/bin/fix-permissions /opt/openshift && \
+    chown -R 1001:0 /opt/openshift && \
+    # the prior chown doesn't traverse the /opt/openshift/plugins links .. this one will assist fix-permission/assemble for extension builds like master/slave
+    chown 1001:0 /usr/lib/jenkins/*hpi && \ 
+    /usr/local/bin/fix-permissions /opt/openshift/configuration/init.groovy.d && \
+    /usr/local/bin/fix-permissions /var/lib/jenkins && \
+    /usr/local/bin/fix-permissions /var/log
+
+VOLUME ["/var/lib/jenkins"]
+
+USER 1001
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["/usr/libexec/s2i/run"]
+
+LABEL \
+        io.k8s.description="Jenkins is a continuous integration server" \
+        io.k8s.display-name="Jenkins 2" \
+        io.openshift.tags="jenkins,jenkins2,ci" \
+        io.openshift.expose-services="8080:http" \
+        io.openshift.s2i.scripts-url="image:///usr/libexec/s2i" \
+        com.redhat.component="openshift-jenkins-2-container" \
+        name="openshift3/jenkins-2-rhel7" \
+        version="v3.11.272" \
+        architecture="x86_64" \
+        License="GPLv2+" \
+        vendor="Red Hat" \
+        io.openshift.maintainer.product="OpenShift Container Platform" \
+        io.openshift.maintainer.component="Jenkins" \
+        release="1" \
+        io.openshift.build.commit.id="b7442aa2f11e04f870f878a646b0f8384a296316" \
+        io.openshift.build.source-location="https://github.com/openshift/jenkins" \
+        io.openshift.build.commit.url="https://github.com/openshift/jenkins/commit/b7442aa2f11e04f870f878a646b0f8384a296316"
